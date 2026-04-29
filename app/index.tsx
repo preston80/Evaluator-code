@@ -26,6 +26,10 @@ import * as FileSystem from 'expo-file-system';
 
 import * as Sentry from '@sentry/react-native';
 
+import { requireNativeModule } from 'expo-modules-core';
+
+const ExpoVideoAnalyzer = requireNativeModule('ExpoVideoAnalyzer');
+
 const width = Dimensions.get('window').width;
 const height = Dimensions.get('window').height;
 console.log(width)
@@ -104,12 +108,26 @@ export default function HomePage() {
           data: { width, height },
         });
 
+        console.log("Selected video URI:", selectedVideoUri);
+        console.log("Initializing detector...");
+
+        const initResult = await ExpoVideoAnalyzer.initialize();
+        console.log("Initialize result:", initResult);
+
+        const analysisResult = await ExpoVideoAnalyzer.analyzeVideo(selectedVideoUri, userId);
+
+        console.log("=== VIDEO ANALYSIS RESULT ===");
+        console.log("Total time (ms):", analysisResult.totalTimeMs);
+        console.log("Avg per frame (ms):", analysisResult.avgTimePerFrameMs);
+        console.log("Frames processed:", analysisResult.totalFrames);
+
         setVideoDimensions({ width, height });
         setVideoUri(selectedVideoUri);
         setvideofile(selectedVideoUri);
         setIsCameraOpen(false);
         setsendButton(true);
       }
+
     } catch (error) {
       Sentry.captureException(error, {
         tags: { area: 'video_picker', action: 'pick_video' },

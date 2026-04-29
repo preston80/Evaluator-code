@@ -1,4 +1,6 @@
 package expo.modules.videoanalyzer
+
+import kotlinx.coroutines.channels.Channel
 import expo.modules.camerax.Detector
 import expo.modules.camerax.Profile
 
@@ -18,16 +20,20 @@ import java.io.InputStream
 import android.content.Context
 import android.content.res.AssetManager
 import java.io.File
-import java.io.FileOutputStream
-import android.graphics.Bitmap.CompressFormat
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
-import android.os.Environment
 
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import expo.modules.camerax.HandLandmarkerHelper
 
 import kotlin.time.measureTime
+
+data class VideoAnalysisMetrics(
+    val success: Boolean,
+    val totalFrames: Int,
+    val totalTimeMs: Long,
+    val avgTimePerFrameMs: Double
+)
 
 class ExpoVideoAnalyzerModule : Module() {
     private var detector: Detector? = null
@@ -177,11 +183,18 @@ class ExpoVideoAnalyzerModule : Module() {
                     }
                     setUserId(userId)
                     Log.d("AnalyzeVideo", "Starting video analysis for: $videoUri")
-                    val worked = classifyVideoStream(videoUri, 10)
+                    val metrics = classifyVideoStreamPipelined(videoUri, 10)
                     profile.endSessionAndGetSummary(userId)
                     withContext(Dispatchers.Main) {
-                        if (worked) {
-                            promise.resolve(worked)
+                        if (metrics.success) {
+                            promise.resolve(
+                                mapOf(
+                                    "success" to true,
+                                    "totalFrames" to metrics.totalFrames,
+                                    "totalTimeMs" to metrics.totalTimeMs,
+                                    "avgTimePerFrameMs" to metrics.avgTimePerFrameMs
+                                )
+                            )
                         } else {
                             promise.reject("PROCESSING_ERROR", "Failed to process video frames", null)
                         }
@@ -667,9 +680,12 @@ class ExpoVideoAnalyzerModule : Module() {
     private fun classifyVideoStream(
         videoURI: String,
         targetFPS: Int = 10
-    ): Boolean {
+    ): VideoAnalysisMetrics {
         val retriever = MediaMetadataRetriever()
         var landmarkerHelper: HandLandmarkerHelper? = null
+
+        val overallStart = System.nanoTime()
+        var frameCount = 0
 
         try {
             retriever.setDataSource(appContext.reactContext, Uri.parse(videoURI))
@@ -702,7 +718,6 @@ class ExpoVideoAnalyzerModule : Module() {
             profile.createNewID(userId) //starts a new session
 
             var timeUs = 0L
-            var frameCount = 0
 
             while (timeUs < duration * 1000) {
                 if (isCancelled) {
@@ -711,16 +726,35 @@ class ExpoVideoAnalyzerModule : Module() {
                 var frame: Bitmap? = null
 
                 try {
-                    frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
 
                     if (frame != null) {
-                        val processingFrame = if (frame.config != Bitmap.Config.ARGB_8888) {
-                            val converted = frame.copy(Bitmap.Config.ARGB_8888, false)
-                            frame.recycle()
+                        val ownedFrame = frame
+                        frame = null
+
+                        var processingFrame = if (ownedFrame.config != Bitmap.Config.ARGB_8888) {
+                            val converted = ownedFrame.copy(Bitmap.Config.ARGB_8888, false)
+                            ownedFrame.recycle()
                             converted
                         } else {
-                            frame
+                            ownedFrame
                         }
+
+                        // downsampling
+                        val scaledFrame = Bitmap.createScaledBitmap(
+                            processingFrame,
+                            640,
+                            480,
+                            false
+                        )
+
+
+                        if (scaledFrame != processingFrame) {
+                            processingFrame.recycle()
+                        }
+
+                        processingFrame = scaledFrame
+
                         val bowResults = detector!!.classify(detector!!.detect(processingFrame))
 
                         val handResults = landmarkerHelper.detectVideoFrame(processingFrame, timeUs/1000)
@@ -730,11 +764,20 @@ class ExpoVideoAnalyzerModule : Module() {
                         if (handResults != null) {
                             profile.addSessionData(userId, handResults)
                         }
-                        if (processingFrame != frame) processingFrame.recycle()
+
+                        // always recycle at the end
+                        processingFrame.recycle()
                     }
                 } catch (e: Exception) {
                     Log.e("AnalyzeVideo", "Error frame $frameCount: ${e.message}")
-                    return false
+
+                    val totalTimeMs = (System.nanoTime() - overallStart) / 1_000_000
+                    return VideoAnalysisMetrics(
+                        success = false,
+                        totalFrames = frameCount,
+                        totalTimeMs = totalTimeMs,
+                        avgTimePerFrameMs = if (frameCount > 0) totalTimeMs.toDouble() / frameCount else 0.0
+                    )
                 } finally {
                     frame?.recycle()
                 }
@@ -743,13 +786,158 @@ class ExpoVideoAnalyzerModule : Module() {
             }
         } catch (e: Exception) {
             Log.e("VideoProcess", "Failed to process video: ${e.message}")
-            return false
+            val totalTimeMs = (System.nanoTime() - overallStart) / 1_000_000
+
+            return VideoAnalysisMetrics(
+                success = true,
+                totalFrames = frameCount,
+                totalTimeMs = totalTimeMs,
+                avgTimePerFrameMs = if (frameCount > 0) totalTimeMs.toDouble() / frameCount else 0.0
+            )
         } finally {
             retriever.release()
             landmarkerHelper?.clearLandmarkers()
         }
 
-        return true
+        val totalTimeMs = (System.nanoTime() - overallStart) / 1_000_000
+
+        return VideoAnalysisMetrics(
+            success = true,
+            totalFrames = frameCount,
+            totalTimeMs = totalTimeMs,
+            avgTimePerFrameMs = if (frameCount > 0) totalTimeMs.toDouble() / frameCount else 0.0
+        )
+    }
+
+    private suspend fun classifyVideoStreamPipelined(
+        videoURI: String,
+        targetFPS: Int = 10
+    ): VideoAnalysisMetrics {
+        val retriever = MediaMetadataRetriever()
+        var landmarkerHelper: HandLandmarkerHelper? = null
+
+        val overallStart = System.nanoTime()
+        var frameCount = 0
+
+        try {
+            retriever.setDataSource(appContext.reactContext, Uri.parse(videoURI))
+
+            val duration = retriever.extractMetadata(
+                MediaMetadataRetriever.METADATA_KEY_DURATION
+            )?.toLong() ?: 0L
+
+            val timeDelta = 1_000_000L / targetFPS
+
+            val frameChannel = Channel<Pair<Bitmap, Long>>(capacity = 4)
+
+            landmarkerHelper = HandLandmarkerHelper(
+                context = appContext.reactContext!!,
+                runningMode = RunningMode.VIDEO,
+                combinedLandmarkerHelperListener = null,
+                maxNumHands = 2
+            )
+
+            profile.createNewID(userId)
+
+            val producer = CoroutineScope(Dispatchers.IO).launch {
+                var timeUs = 0L
+
+                try {
+                    while (timeUs < duration * 1000L && !isCancelled) {
+                        var frame: Bitmap? = null
+
+                        try {
+                            frame = retriever.getFrameAtTime(
+                                timeUs,
+                                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                            )
+
+                            if (frame != null) {
+                                val argbFrame = if (frame.config != Bitmap.Config.ARGB_8888) {
+                                    val converted = frame.copy(Bitmap.Config.ARGB_8888, false)
+                                    frame.recycle()
+                                    frame = null
+                                    converted
+                                } else {
+                                    frame
+                                }
+
+                                val scaledFrame = Bitmap.createScaledBitmap(
+                                    argbFrame,
+                                    640,
+                                    480,
+                                    false
+                                )
+
+                                if (scaledFrame != argbFrame) {
+                                    argbFrame.recycle()
+                                }
+
+                                frameChannel.send(Pair(scaledFrame, timeUs))
+                            }
+                        } catch (e: Exception) {
+                            Log.e("PipelineProducer", "Error extracting frame at $timeUs: ${e.message}")
+                            frame?.recycle()
+                        }
+
+                        timeUs += timeDelta
+                    }
+                } finally {
+                    frameChannel.close()
+                }
+            }
+
+            for ((bitmap, timeUs) in frameChannel) {
+                if (isCancelled) {
+                    bitmap.recycle()
+                    break
+                }
+
+                try {
+                    val bowResults = detector!!.classify(detector!!.detect(bitmap))
+                    val handResults = landmarkerHelper.detectVideoFrame(bitmap, timeUs / 1000)
+
+                    if (bowResults != null) {
+                        profile.addSessionData(userId, bowResults)
+                    }
+
+                    if (handResults != null) {
+                        profile.addSessionData(userId, handResults)
+                    }
+
+                    frameCount++
+                } catch (e: Exception) {
+                    Log.e("PipelineConsumer", "Error processing frame $frameCount: ${e.message}")
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+
+            producer.cancelAndJoin()
+
+        } catch (e: Exception) {
+            Log.e("Pipeline", "Failed: ${e.message}")
+
+            val totalTimeMs = (System.nanoTime() - overallStart) / 1_000_000
+            return VideoAnalysisMetrics(
+                success = false,
+                totalFrames = frameCount,
+                totalTimeMs = totalTimeMs,
+                avgTimePerFrameMs = if (frameCount > 0) totalTimeMs.toDouble() / frameCount else 0.0
+            )
+        } finally {
+            retriever.release()
+            landmarkerHelper?.clearLandmarkers()
+        }
+
+        val totalTimeMs = (System.nanoTime() - overallStart) / 1_000_000
+
+        return VideoAnalysisMetrics(
+            success = true,
+            totalFrames = frameCount,
+            totalTimeMs = totalTimeMs,
+            avgTimePerFrameMs = if (frameCount > 0) totalTimeMs.toDouble() / frameCount else 0.0
+        )
     }
 
     // Helper function. It loops through the video, extracts frames into bitmap format, calls
