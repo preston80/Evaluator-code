@@ -57,6 +57,7 @@ interface CameraComponentProps {
   startDelay?: number;
   onClose: () => void;
   initialHistoryOpen?: boolean;
+  initialSetupOpen?: boolean;
 }
 
 const SESSIONS_PER_PAGE = 5;
@@ -71,6 +72,7 @@ const CameraComponent: React.FC<CameraComponentProps> = ({
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isDetectionEnabled, setIsDetectionEnabled] = useState(false);
   const [lensType, setLensType] = useState('back'); // use front or back camera
+  const [instrumentMode, setInstrumentMode] = useState<'cello' | 'violin'>('cello'); // instrument mode switch
   const [userId, setUserId] = useState('default_user');
   const [showSetupOverlay, setShowSetupOverlay] = useState(initialSetupOpen);
   const [showCountdown, setShowCountdown] = useState(false);
@@ -945,7 +947,14 @@ const CameraComponent: React.FC<CameraComponentProps> = ({
         onCalibrated={handleCalibrated}
         skipCalibration={!showSetupOverlay}
         maxBowAngle={maxAngle}
+        instrumentMode={instrumentMode}
       />
+
+      <View style={styles.instrumentModeBadge}>
+        <Text style={styles.instrumentModeBadgeText}>
+          Mode: {instrumentMode === 'cello' ? 'Cello' : 'Violin'}
+        </Text>
+      </View>
 
       {/* Top-left menu + dropdown */}
       <View style={styles.topLeftMenuArea}>
@@ -959,6 +968,22 @@ const CameraComponent: React.FC<CameraComponentProps> = ({
 
         {toolbarExpanded && (
           <View style={styles.menuPanel}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setInstrumentMode(prev => prev === 'cello' ? 'violin' : 'cello');
+                setToolbarExpanded(false);
+              }}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.menuItemIcon}>
+                {instrumentMode === 'cello' ? '🎻' : '🎼'}
+              </Text>
+              <Text style={styles.menuItemText}>
+                Switch to {instrumentMode === 'cello' ? 'Violin' : 'Cello'}
+              </Text>
+            </TouchableOpacity>
+
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => {
